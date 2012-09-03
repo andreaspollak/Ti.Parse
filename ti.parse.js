@@ -1,7 +1,7 @@
 /*!
  * Parse JavaScript SDK
- * Version: 1.0.8
- * Built: Mon Jul 09 2012 15:57:07
+ * Version: 1.0.20
+ * Built: Wed Aug 22 2012 17:40:25
  * http://parse.com
  *
  * Copyright 2012 Parse, Inc.
@@ -13,7 +13,7 @@
  */
 (function(root) {
   root.Parse = root.Parse || {};
-  root.Parse.VERSION = "1.0.8";
+  root.Parse.VERSION = "1.0.20";
 }(this));
 
 
@@ -1109,7 +1109,7 @@
   // Shared empty constructor function to aid in prototype-chain creation.
   var EmptyConstructor = function() {};
 
-  
+
   // Helper function to correctly set up the prototype chain, for subclasses.
   // Similar to `goog.inherits`, but uses a hash of prototype properties and
   // class properties to be extended.
@@ -1165,8 +1165,21 @@
    * @param {String} javaScriptKey Your Parse JavaScript Key.
    */
   Parse.initialize = function(applicationId, javaScriptKey) {
+    Parse._initialize(applicationId, javaScriptKey);
+  };
+
+  /**
+   * Call this method first to set up master authentication tokens for Parse.
+   * This method is for Parse's own private use.
+   * @param {String} applicationId Your Parse Application ID.
+   * @param {String} javaScriptKey Your Parse JavaScript Key.
+   * @param {String} masterKey Your Parse Master Key.
+   */
+  Parse._initialize = function(applicationId, javaScriptKey, masterKey) {
     Parse.applicationId = applicationId;
     Parse.javaScriptKey = javaScriptKey;
+    Parse.masterKey = masterKey;
+    Parse._useMasterKey = false;
   };
 
   /**
@@ -1274,9 +1287,16 @@
       return Parse._ajaxIE8(method, url, data, success, error);
     }
 
+    var handled = false;
+
     var xhr = Titanium.Network.createHTTPClient();
     xhr.onreadystatechange = function() {
       if (xhr.readyState === 4) {
+        if (handled) {
+          return;
+        }
+        handled = true;
+
         if (xhr.status >= 200 && xhr.status < 300) {
           var response;
           try {
@@ -1320,12 +1340,15 @@
    */
   Parse._request = function(route, className, objectId, method, dataObject,
                             options) {
-    if (!Parse.applicationId || !Parse.javaScriptKey) {
-      throw "You must specify your applicationId and javaScriptKey using " +
-        "Parse.initialize";
+    if (!Parse.applicationId) {
+      throw "You must specify your applicationId using Parse.initialize";
     }
 
-    
+    if (!Parse.javaScriptKey && !Parse.masterKey) {
+      throw "You must specify a key using Parse.initialize";
+    }
+
+
     if (route !== "classes" &&
         route !== "users" &&
         route !== "login" &&
@@ -1348,7 +1371,11 @@
       method = "POST";
     }
     dataObject._ApplicationId = Parse.applicationId;
-    dataObject._JavaScriptKey = Parse.javaScriptKey;
+    if (!Parse._useMasterKey) {
+      dataObject._JavaScriptKey = Parse.javaScriptKey;
+    } else {
+      dataObject._MasterKey = Parse.masterKey;
+    }
     dataObject._ClientVersion = "js" + Parse.VERSION;
     dataObject._InstallationId = Parse._getInstallationId();
     // Pass the session token on every request.
@@ -1372,22 +1399,46 @@
 
   /**
    * Converts a value in a Parse Object into the appropriate representation.
-   * This is the JS equivalent of Java's Parse.maybeReferenceAndEncode(Object).
+   * This is the JS equivalent of Java's Parse.maybeReferenceAndEncode(Object)
+   * if seenObjects is falsey. Otherwise any Parse.Objects not in
+   * seenObjects will be fully embedded rather than encoded
+   * as a pointer.  This array will be used to prevent going into an infinite
+   * loop because we have circular references.  If <seenObjects>
+   * is set, then none of the Parse Objects that are serialized can be dirty.
    */
-  Parse._encode = function(value) {
+  Parse._encode = function(value, seenObjects) {
     var _ = Parse._;
     if (value instanceof Parse.Object) {
-      return value._toPointer();
+      if (!seenObjects || _.include(seenObjects, value) || !value._hasData) {
+        return value._toPointer();
+      } else if (!value.dirty()) {
+        seenObjects = seenObjects.concat(value);
+        return Parse._encode(value._toFullJSON(seenObjects), seenObjects);
+      } else {
+        throw "Can't fully embed a dirty object";
+      }
     } else if (value instanceof Parse.ACL) {
       return value.toJSON();
     } else if (value instanceof Date) {
       return { "__type": "Date", "iso": value.toJSON() };
+    } else if (value instanceof Parse.GeoPoint) {
+      return value.toJSON();
     } else if (_.isArray(value)) {
-      return _.map(value, Parse._encode);
+      return _.map(value, function(x) {
+        return Parse._encode(x, seenObjects);
+      });
     } else if (_.isRegExp(value)) {
       return value.source;
     } else if (value instanceof Parse.Relation) {
       return value.toJSON();
+    } else if (value instanceof Parse.Op) {
+      return value.toJSON();
+    } else if (value instanceof Object) {
+      var output = {};
+      Parse._each(value, function(v, k) {
+        output[k] = Parse._encode(v, seenObjects);
+      });
+      return output;
     } else {
       return value;
     }
@@ -1407,22 +1458,24 @@
       return value;
     } else if (value instanceof Parse.Object) {
       return value;
+    } else if (value instanceof Parse.Op) {
+      return value;
+    } else if (value.__op) {
+      // Must be a Op.
+      return Parse.Op._decode(value);
     } else if (value.objectId) {
       // Must be a Pointer or a JSON Parse Object.
       if (value.__type === "Pointer") {
-        var pointer = Parse.Object._create(value.className,
-                                           {objectId: value.objectId});
-        pointer._refreshCache();
-        pointer._dirty = {};
+        var pointer = Parse.Object._create(value.className);
+        pointer._finishFetch({ objectId: value.objectId }, false);
         return pointer;
       } else if (value.__type === "Object") {
         // It's an Object included in a query result.
         var className = value.className;
         delete value.__type;
         delete value.className;
-        var object = Parse.Object._create(className, value);
-        object._refreshCache();
-        object._dirty = {};
+        var object = Parse.Object._create(className);
+        object._finishFetch(value, true);
         return object;
       } else {
         Parse._each(value, function(val, key) {
@@ -1444,7 +1497,7 @@
         return new Parse.ACL(value);
       }
     } else if (value.__type === "Relation") {
-      var relation = new Parse.Relation(this, key);
+      var relation = new Parse.Relation(null, key);
       relation.targetClassName = value.className;
       return relation;
     } else {
@@ -1469,149 +1522,11 @@
     }
   };
 
-}(this));
-
-(function(root) {
-  root.Parse = root.Parse || {};
-  var Parse = root.Parse;
-  var _ = Parse._;
-
-  /**
-   * Creates a new Relation for the given parent object and key. This
-   * constructor should rarely be used directly, but rather created by
-   * Parse.Object.relation.
-   * @param {Parse.Object} parent The parent of this relation.
-   * @param {String} key The key for this relation on the parent.
-   * @see Parse.Object#relation
-   * @class
-   *
-   * <p>
-   * A class that is used to access all of the children of a many-to-many
-   * relationship.  Each instance of Parse.Relation is associated with a
-   * particular parent object and key.
-   * </p>
-   */
-  Parse.Relation = function(parent, key) {
-    this.parent = parent;
-    this.key = key;
-    this.targetClassName = null;
-    this.relationsToAdd = [];
-    this.relationsToRemove = [];
+  // Helper function to check null or undefined.
+  Parse._isNullOrUndefined = function(x) {
+    return Parse._.isNull(x) || Parse._.isUndefined(x);
   };
 
-  Parse.Relation.prototype = {
-    /**
-     * Adds a Parse.Object or an array of Parse.Objects to the relation.
-     * @param {} objects The item or items to add.
-     */
-    add: function(objects) {
-      if (!_.isArray(objects)) {
-        objects = [objects];
-      }
-
-      if (!this.targetClassName) {
-        this.targetClassName = objects[0].className;
-      }
-
-      var self = this;
-      _.each(objects, function(object) {
-        if (self.targetClassName !== object.className) {
-          throw "This relation is on objects of class:" + 
-                self.targetClassName + " but got object of class:" +
-                object.className;
-        }
-      });
-
-      objects = _.map(objects,
-                      function(object) { return object.id; });
-      this.relationsToAdd = _.union(this.relationsToAdd, objects);
-      this.relationsToRemove = _.difference(this.relationsToRemove, objects);
-    },
-
-    /**
-     * Removes a Parse.Object or an array of Parse.Objects from this relation.
-     * @param {} objects The item or items to remove.
-     */
-    remove: function(objects) {
-      if (!_.isArray(objects)) {
-        objects = [objects];
-      }
-
-      if (!this.targetClassName) {
-        this.targetClassName = objects[0].className;
-      }
-
-      var self = this;
-      _.each(objects, function(object) {
-        if (self.targetClassName !== object.className) {
-          throw "This relation is on objects of class:" + 
-                self.targetClassName + " but got object of class:" +
-                object.className;
-        }
-      });
-
-
-      objects = _.map(objects,
-                      function(object) { return object.id; });
-      this.relationsToRemove = _.union(this.relationsToRemove, objects);
-      this.relationsToAdd = _.difference(this.relationsToAdd, objects);
-    },
-
-    _dirty: function() {
-      return this.relationsToAdd.length > 0 ||
-             this.relationsToRemove.length > 0;
-    },
-
-    /**
-     * Returns a JSON version of the object suitable for saving to parse.
-     * @return {Object}
-     */
-    toJSON: function() {
-      var adds = null;
-      var removes = null;
-      var self = this;
-      var idToPointer = function(id) {
-        return { __type: 'Pointer',
-                 className: self.targetClassName,
-                 objectId: id };
-      };
-      var pointers = null;
-      if (this.relationsToAdd.length > 0) {
-        pointers = _.map(this.relationsToAdd, idToPointer);
-        adds = { "__op": "AddRelation", "objects": pointers };
-      }
-
-      if (this.relationsToRemove.length > 0) {
-        pointers = _.map(this.relationsToRemove, idToPointer);
-        removes = { "__op": "RemoveRelation", "objects": pointers };
-      }
-
-      if (adds && removes) {
-        return { "__op": "Batch", "ops": [adds, removes]};
-      }
-
-      return adds || removes ||
-             { "__type": "Relation", "className": this.targetClassName };
-    },
-
-    /**
-     * Returns a Parse.Query that is limited to objects in this
-     * relation.
-     * @return {Parse.Query}
-     */
-    query: function() {
-      var targetClass = Parse.Object._getSubclass(this.targetClassName);
-      var query = new Parse.Query(targetClass);
-      query._addCondition("$relatedTo", "object", this.parent._toPointer());
-      query._addCondition("$relatedTo", "key", this.key);
-      return query;
-    },
-
-    _clearUpdates: function () {
-      this.relationsToRemove = [];
-      this.relationsToAdd = [];
-    }
-  };
 }(this));
 
 (function(root) {
@@ -1786,6 +1701,26 @@
      * @constant
      */
     INVALID_EMAIL_ADDRESS: 125,
+
+    /**
+     * Error code indicating that a unique field was given a value that is
+     * already taken.
+     * @constant
+     */
+    DUPLICATE_VALUE: 137,
+
+    /**
+     * Error code indicating that a role's name is invalid.
+     * @constant
+     */
+    INVALID_ROLE_NAME: 139,
+
+    /**
+     * Error code indicating that an application quota was exceeded.  Upgrade to
+     * resolve.
+     * @constant
+     */
+    EXCEEDED_QUOTA: 140,
 
     /**
      * Error code indicating that the username is missing or empty.
@@ -2010,7 +1945,7 @@
 
       return this;
     }
-  };  
+  };
 
   /**
    * @function
@@ -2380,12 +2315,12 @@
   Parse.ACL.prototype.getPublicWriteAccess = function() {
     return this.getWriteAccess(PUBLIC_KEY);
   };
-  
+
   /**
    * Get whether users belonging to the given role are allowed
    * to read this object. Even if this returns false, the role may
    * still be able to write it if a parent role has read access.
-   * 
+   *
    * @param role The name of the role, or a Parse.Role object.
    * @return {Boolean} true if the role has read access. false otherwise.
    * @throws {String} If role is neither a Parse.Role nor a String.
@@ -2400,12 +2335,12 @@
     }
     throw "role must be a Parse.Role or a String";
   };
-  
+
   /**
    * Get whether users belonging to the given role are allowed
    * to write this object. Even if this returns false, the role may
    * still be able to write it if a parent role has write access.
-   * 
+   *
    * @param role The name of the role, or a Parse.Role object.
    * @return {Boolean} true if the role has write access. false otherwise.
    * @throws {String} If role is neither a Parse.Role nor a String.
@@ -2420,11 +2355,11 @@
     }
     throw "role must be a Parse.Role or a String";
   };
-  
+
   /**
    * Set whether users belonging to the given role are allowed
    * to read this object.
-   * 
+   *
    * @param role The name of the role, or a Parse.Role object.
    * @param {Boolean} allowed Whether the given role can read this object.
    * @throws {String} If role is neither a Parse.Role nor a String.
@@ -2440,11 +2375,11 @@
     }
     throw "role must be a Parse.Role or a String";
   };
-  
+
   /**
    * Set whether users belonging to the given role are allowed
    * to write this object.
-   * 
+   *
    * @param role The name of the role, or a Parse.Role object.
    * @param {Boolean} allowed Whether the given role can write this object.
    * @throws {String} If role is neither a Parse.Role nor a String.
@@ -2463,6 +2398,602 @@
 
 }(this));
 
+(function(root) {
+  root.Parse = root.Parse || {};
+  var Parse = root.Parse;
+  var _ = Parse._;
+
+  /**
+   * @class
+   * A Parse.Op is an atomic operation that can be applied to a field in a
+   * Parse.Object. For example, calling <code>object.set("foo", "bar")</code>
+   * is an example of a Parse.Op.Set. Calling <code>object.unset("foo")</code>
+   * is a Parse.Op.Unset. These operations are stored in a Parse.Object and
+   * sent to the server as part of <code>object.save()</code> operations.
+   * Instances of Parse.Op should be immutable.
+   *
+   * You should not create subclasses of Parse.Op or instantiate Parse.Op
+   * directly.
+   */
+  Parse.Op = function() {
+    this._initialize.apply(this, arguments);
+  };
+
+  Parse.Op.prototype = {
+    _initialize: function() {}
+  };
+
+  _.extend(Parse.Op, {
+    /**
+     * To create a new Op, call Parse.Op._extend();
+     */
+    _extend: Parse._extend,
+
+    // A map of __op string to decoder function.
+    _opDecoderMap: {},
+
+    /**
+     * Registers a function to convert a json object with an __op field into an
+     * instance of a subclass of Parse.Op.
+     */
+    _registerDecoder: function(opName, decoder) {
+      Parse.Op._opDecoderMap[opName] = decoder;
+    },
+
+    /**
+     * Converts a json object into an instance of a subclass of Parse.Op.
+     */
+    _decode: function(json) {
+      var decoder = Parse.Op._opDecoderMap[json.__op];
+      if (decoder) {
+        return decoder(json);
+      } else {
+        return undefined;
+      }
+    }
+  });
+
+  /*
+   * Add a handler for Batch ops.
+   */
+  Parse.Op._registerDecoder("Batch", function(json) {
+    var op = null;
+    _.each(json.ops, function(nextOp) {
+      nextOp = Parse.Op._decode(nextOp);
+      op = nextOp._mergeWithPrevious(op);
+    });
+    return op;
+  });
+
+  /**
+   * @class
+   * A Set operation indicates that either the field was changed using
+   * Parse.Object.set, or it is a mutable container that was detected as being
+   * changed.
+   */
+  Parse.Op.Set = Parse.Op._extend(/** @lends Parse.Op.Set.prototype */ {
+    _initialize: function(value) {
+      this._value = value;
+    },
+
+    /**
+     * Returns the new value of this field after the set.
+     */
+    value: function() {
+      return this._value;
+    },
+
+    /**
+     * Returns a JSON version of the operation suitable for sending to Parse.
+     * @return {Object}
+     */
+    toJSON: function() {
+      return Parse._encode(this.value());
+    },
+
+    _mergeWithPrevious: function(previous) {
+      return this;
+    },
+
+    _estimate: function(oldValue) {
+      return this.value();
+    }
+  });
+
+  /**
+   * A sentinel value that is returned by Parse.Op.Unset._estimate to
+   * indicate the field should be deleted. Basically, if you find _UNSET as a
+   * value in your object, you should remove that key.
+   */
+  Parse.Op._UNSET = {};
+
+  /**
+   * @class
+   * An Unset operation indicates that this field has been deleted from the
+   * object.
+   */
+  Parse.Op.Unset = Parse.Op._extend(/** @lends Parse.Op.Unset.prototype */ {
+    /**
+     * Returns a JSON version of the operation suitable for sending to Parse.
+     * @return {Object}
+     */
+    toJSON: function() {
+      return { __op: "Delete" };
+    },
+
+    _mergeWithPrevious: function(previous) {
+      return this;
+    },
+
+    _estimate: function(oldValue) {
+      return Parse.Op._UNSET;
+    }
+  });
+
+  Parse.Op._registerDecoder("Delete", function(json) {
+    return new Parse.Op.Unset();
+  });
+
+  /**
+   * @class
+   * An Increment is an atomic operation where the numeric value for the field
+   * will be increased by a given amount.
+   */
+  Parse.Op.Increment = Parse.Op._extend(
+      /** @lends Parse.Op.Increment.prototype */ {
+
+    _initialize: function(amount) {
+      this._amount = amount;
+    },
+
+    /**
+     * Returns the amount to increment by.
+     * @return {Number} the amount to increment by.
+     */
+    amount: function() {
+      return this._amount;
+    },
+
+    /**
+     * Returns a JSON version of the operation suitable for sending to Parse.
+     * @return {Object}
+     */
+    toJSON: function() {
+      return { __op: "Increment", amount: this._amount };
+    },
+
+    _mergeWithPrevious: function(previous) {
+      if (!previous) {
+        return this;
+      } else if (previous instanceof Parse.Op.Unset) {
+        return new Parse.Op.Set(this.amount());
+      } else if (previous instanceof Parse.Op.Set) {
+        return new Parse.Op.Set(previous.value() + this.amount());
+      } else if (previous instanceof Parse.Op.Increment) {
+        return new Parse.Op.Increment(this.amount() + previous.amount());
+      } else {
+        throw "Op is invalid after previous op.";
+      }
+    },
+
+    _estimate: function(oldValue) {
+      if (!oldValue) {
+        return this.amount();
+      }
+      return oldValue + this.amount();
+    }
+  });
+
+  Parse.Op._registerDecoder("Increment", function(json) {
+    return new Parse.Op.Increment(json.amount);
+  });
+
+  /**
+   * @class
+   * Add is an atomic operation where the given objects will be appended to the
+   * array that is stored in this field.
+   */
+  Parse.Op.Add = Parse.Op._extend(/** @lends Parse.Op.Add.prototype */ {
+    _initialize: function(objects) {
+      this._objects = objects;
+    },
+
+    /**
+     * Returns the objects to be added to the array.
+     * @return {Array} The objects to be added to the array.
+     */
+    objects: function() {
+      return this._objects;
+    },
+
+    /**
+     * Returns a JSON version of the operation suitable for sending to Parse.
+     * @return {Object}
+     */
+    toJSON: function() {
+      return { __op: "Add", objects: this.objects() };
+    },
+
+    _mergeWithPrevious: function(previous) {
+      if (!previous) {
+        return this;
+      } else if (previous instanceof Parse.Op.Unset) {
+        return new Parse.Op.Set(this.objects());
+      } else if (previous instanceof Parse.Op.Set) {
+        return new Parse.Op.Set(this._estimate(previous.value()));
+      } else if (previous instanceof Parse.Op.Add) {
+        return new Parse.Op.Add(previous.objects().concat(this.objects()));
+      } else {
+        throw "Op is invalid after previous op.";
+      }
+    },
+
+    _estimate: function(oldValue) {
+      if (!oldValue) {
+        return _.clone(this.objects());
+      } else {
+        return oldValue.concat(this.objects());
+      }
+    }
+  });
+
+  Parse.Op._registerDecoder("Add", function(json) {
+    return new Parse.Op.Add(Parse._decode(json.objects));
+  });
+
+  /**
+   * @class
+   * AddUnique is an atomic operation where the given items will be appended to
+   * the array that is stored in this field only if they were not already
+   * present in the array.
+   */
+  Parse.Op.AddUnique = Parse.Op._extend(
+      /** @lends Parse.Op.AddUnique.prototype */ {
+
+    _initialize: function(objects) {
+      this._objects = _.uniq(objects);
+    },
+
+    /**
+     * Returns the objects to be added to the array.
+     * @return {Array} The objects to be added to the array.
+     */
+    objects: function() {
+      return this._objects;
+    },
+
+    /**
+     * Returns a JSON version of the operation suitable for sending to Parse.
+     * @return {Object}
+     */
+    toJSON: function() {
+      return { __op: "AddUnique", objects: this.objects() };
+    },
+
+    _mergeWithPrevious: function(previous) {
+      if (!previous) {
+        return this;
+      } else if (previous instanceof Parse.Op.Unset) {
+        return new Parse.Op.Set(this.objects());
+      } else if (previous instanceof Parse.Op.Set) {
+        return new Parse.Op.Set(this._estimate(previous.value()));
+      } else if (previous instanceof Parse.Op.AddUnique) {
+        return new Parse.Op.AddUnique(
+          _.union(previous.objects(), this.objects()));
+      } else {
+        throw "Op is invalid after previous op.";
+      }
+    },
+
+    _estimate: function(oldValue) {
+      if (!oldValue) {
+        return _.clone(this.objects());
+      } else {
+        return oldValue.concat(_.difference(this.objects(), oldValue));
+      }
+    }
+  });
+
+  Parse.Op._registerDecoder("AddUnique", function(json) {
+    return new Parse.Op.AddUnique(Parse._decode(json.objects));
+  });
+
+  /**
+   * @class
+   * Remove is an atomic operation where the given objects will be removed from
+   * the array that is stored in this field.
+   */
+  Parse.Op.Remove = Parse.Op._extend(/** @lends Parse.Op.Remove.prototype */ {
+    _initialize: function(objects) {
+      this._objects = _.uniq(objects);
+    },
+
+    /**
+     * Returns the objects to be removed from the array.
+     * @return {Array} The objects to be removed from the array.
+     */
+    objects: function() {
+      return this._objects;
+    },
+
+    /**
+     * Returns a JSON version of the operation suitable for sending to Parse.
+     * @return {Object}
+     */
+    toJSON: function() {
+      return { __op: "Remove", objects: this.objects() };
+    },
+
+    _mergeWithPrevious: function(previous) {
+      if (!previous) {
+        return this;
+      } else if (previous instanceof Parse.Op.Unset) {
+        return previous;
+      } else if (previous instanceof Parse.Op.Set) {
+        return new Parse.Op.Set(this._estimate(previous.value()));
+      } else if (previous instanceof Parse.Op.Remove) {
+        return new Parse.Op.Remove(_.union(previous.objects(), this.objects()));
+      } else {
+        throw "Op is invalid after previous op.";
+      }
+    },
+
+    _estimate: function(oldValue) {
+      if (!oldValue) {
+        return [];
+      } else {
+        return _.difference(oldValue, this.objects());
+      }
+    }
+  });
+
+  Parse.Op._registerDecoder("Remove", function(json) {
+    return new Parse.Op.Remove(Parse._decode(json.objects));
+  });
+
+  /**
+   * @class
+   * A Relation operation indicates that the field is an instance of
+   * Parse.Relation, and objects are being added to, or removed from, that
+   * relation.
+   */
+  Parse.Op.Relation = Parse.Op._extend(
+      /** @lends Parse.Op.Relation.prototype */ {
+
+    _initialize: function(adds, removes) {
+      this._targetClassName = null;
+
+      var self = this;
+
+      var pointerToId = function(object) {
+        if (object instanceof Parse.Object) {
+          if (!object.id) {
+            throw "You can't add an unsaved Parse.Object to a relation.";
+          }
+          if (!self._targetClassName) {
+            self._targetClassName = object.className;
+          }
+          if (self._targetClassName !== object.className) {
+            throw "Tried to create a Parse.Relation with 2 different types: " +
+                  self._targetClassName + " and " + object.className + ".";
+          }
+          return object.id;
+        }
+        return object;
+      };
+
+      this.relationsToAdd = _.uniq(_.map(adds, pointerToId));
+      this.relationsToRemove = _.uniq(_.map(removes, pointerToId));
+    },
+
+    /**
+     * Returns an array of unfetched Parse.Object that are being added to the
+     * relation.
+     * @return {Array}
+     */
+    added: function() {
+      var self = this;
+      return _.map(this.relationsToAdd, function(objectId) {
+        var object = Parse.Object._create(self._targetClassName);
+        object.id = objectId;
+        return object;
+      });
+    },
+
+    /**
+     * Returns an array of unfetched Parse.Object that are being removed from
+     * the relation.
+     * @return {Array}
+     */
+    removed: function() {
+      var self = this;
+      return _.map(this.relationsToRemove, function(objectId) {
+        var object = Parse.Object._create(self._targetClassName);
+        object.id = objectId;
+        return object;
+      });
+    },
+
+    /**
+     * Returns a JSON version of the operation suitable for sending to Parse.
+     * @return {Object}
+     */
+    toJSON: function() {
+      var adds = null;
+      var removes = null;
+      var self = this;
+      var idToPointer = function(id) {
+        return { __type: 'Pointer',
+                 className: self._targetClassName,
+                 objectId: id };
+      };
+      var pointers = null;
+      if (this.relationsToAdd.length > 0) {
+        pointers = _.map(this.relationsToAdd, idToPointer);
+        adds = { "__op": "AddRelation", "objects": pointers };
+      }
+
+      if (this.relationsToRemove.length > 0) {
+        pointers = _.map(this.relationsToRemove, idToPointer);
+        removes = { "__op": "RemoveRelation", "objects": pointers };
+      }
+
+      if (adds && removes) {
+        return { "__op": "Batch", "ops": [adds, removes]};
+      }
+
+      return adds || removes || {};
+    },
+
+    _mergeWithPrevious: function(previous) {
+      if (!previous) {
+        return this;
+      } else if (previous instanceof Parse.Op.Unset) {
+        throw "You can't modify a relation after deleting it.";
+      } else if (previous instanceof Parse.Op.Relation) {
+        if (previous._targetClassName &&
+            previous._targetClassName !== this._targetClassName) {
+          throw "Related object must be of class " + previous._targetClassName +
+              ", but " + this._targetClassName + " was passed in.";
+        }
+        var newAdd = _.union(_.difference(previous.relationsToAdd,
+                                          this.relationsToRemove),
+                             this.relationsToAdd);
+        var newRemove = _.union(_.difference(previous.relationsToRemove,
+                                             this.relationsToAdd),
+                                this.relationsToRemove);
+
+        var newRelation = new Parse.Op.Relation(newAdd, newRemove);
+        newRelation._targetClassName = this._targetClassName;
+        return newRelation;
+      } else {
+        throw "Op is invalid after previous op.";
+      }
+    },
+
+    _estimate: function(oldValue, object, key) {
+      if (!oldValue) {
+        var relation = new Parse.Relation(object, key);
+        relation.targetClassName = this._targetClassName;
+      } else if (oldValue instanceof Parse.Relation) {
+        if (this._targetClassName) {
+          if (oldValue.targetClassName) {
+            if (oldValue.targetClassName !== this._targetClassName) {
+              throw "Related object must be a " + oldValue.targetClassName +
+                  ", but a " + this._targetClassName + " was passed in.";
+            }
+          } else {
+            oldValue.targetClassName = this._targetClassName;
+          }
+        }
+        return oldValue;
+      } else {
+        throw "Op is invalid after previous op.";
+      }
+    }
+  });
+
+  Parse.Op._registerDecoder("AddRelation", function(json) {
+    return new Parse.Op.Relation(json.objects, []);
+  });
+  Parse.Op._registerDecoder("RemoveRelation", function(json) {
+    return new Parse.Op.Relation([], json.objects);
+  });
+
+}(this));
+
+(function(root) {
+  root.Parse = root.Parse || {};
+  var Parse = root.Parse;
+  var _ = Parse._;
+
+  /**
+   * Creates a new Relation for the given parent object and key. This
+   * constructor should rarely be used directly, but rather created by
+   * Parse.Object.relation.
+   * @param {Parse.Object} parent The parent of this relation.
+   * @param {String} key The key for this relation on the parent.
+   * @see Parse.Object#relation
+   * @class
+   *
+   * <p>
+   * A class that is used to access all of the children of a many-to-many
+   * relationship.  Each instance of Parse.Relation is associated with a
+   * particular parent object and key.
+   * </p>
+   */
+  Parse.Relation = function(parent, key) {
+    this.parent = parent;
+    this.key = key;
+    this.targetClassName = null;
+  };
+
+  Parse.Relation.prototype = {
+    /**
+     * Makes sure that this relation has the right parent and key.
+     */
+    _ensureParentAndKey: function(parent, key) {
+      this.parent = this.parent || parent;
+      this.key = this.key || key;
+      if (this.parent !== parent) {
+        throw "Internal Error. Relation retrieved from two different Objects.";
+      }
+      if (this.key !== key) {
+        throw "Internal Error. Relation retrieved from two different keys.";
+      }
+    },
+
+    /**
+     * Adds a Parse.Object or an array of Parse.Objects to the relation.
+     * @param {} objects The item or items to add.
+     */
+    add: function(objects) {
+      if (!_.isArray(objects)) {
+        objects = [objects];
+      }
+
+      var change = new Parse.Op.Relation(objects, []);
+      this.parent.set(this.key, change);
+      this.targetClassName = change._targetClassName;
+    },
+
+    /**
+     * Removes a Parse.Object or an array of Parse.Objects from this relation.
+     * @param {} objects The item or items to remove.
+     */
+    remove: function(objects) {
+      if (!_.isArray(objects)) {
+        objects = [objects];
+      }
+
+      var change = new Parse.Op.Relation([], objects);
+      this.parent.set(this.key, change);
+      this.targetClassName = change._targetClassName;
+    },
+
+    /**
+     * Returns a JSON version of the object suitable for saving to disk.
+     * @return {Object}
+     */
+    toJSON: function() {
+      return { "__type": "Relation", "className": this.targetClassName };
+    },
+
+    /**
+     * Returns a Parse.Query that is limited to objects in this
+     * relation.
+     * @return {Parse.Query}
+     */
+    query: function() {
+      var targetClass = Parse.Object._getSubclass(this.targetClassName);
+      var query = new Parse.Query(targetClass);
+      query._addCondition("$relatedTo", "object", this.parent._toPointer());
+      query._addCondition("$relatedTo", "key", this.key);
+      return query;
+    }
+  };
+}(this));
+
 // Parse.Object is analogous to the Java ParseObject.
 // It also implements the same interface as a Backbone model.
 
@@ -2470,11 +3001,6 @@
   root.Parse = root.Parse || {};
   var Parse = root.Parse;
   var _ = Parse._;
-
-  // Helper function to check null or undefined.
-  var isNullOrUndefined = function(x) {
-    return _.isNull(x) || _.isUndefined(x);
-  };
 
   /**
    * Creates a new model with defined attributes. A client id (cid) is
@@ -2520,16 +3046,24 @@
     if (options && options.collection) {
       this.collection = options.collection;
     }
-    this.attributes = {};  // The actual data for the Parse Object.
-    this._operations = {};  // Operations such as increment and unset.
-    this._dirty = {};  // The keys in the object that haven't been saved.
+
+    this._serverData = {};  // The last known data for this object from cloud.
+    this._opSetQueue = [{}];  // List of sets of changes to the data.
+    this.attributes = {};  // The best estimate of this's current data.
+
     this._hashedJSON = {};  // Hash of values of containers at last save.
     this._escapedAttributes = {};
     this.cid = _.uniqueId('c');
+    this.changed = {};
+    this._silent = {};
+    this._pending = {};
     if (!this.set(attributes, {silent: true})) {
       throw new Error("Can't create an invalid Parse.Object");
     }
-    delete this._changed;
+    this.changed = {};
+    this._silent = {};
+    this._pending = {};
+    this._hasData = true;
     this._previousAttributes = _.clone(this.attributes);
     this.initialize.apply(this, arguments);
   };
@@ -2566,9 +3100,9 @@
       var newOptions = options ? _.clone(options) : {};
       newOptions.success = function(model, response) {
         results.push(model);
-        _doAll(list.slice(1), func, results, oldOptions);
+        _doAll(_.rest(list), func, results, oldOptions);
       };
-      func.call(this, list[0], newOptions);
+      func.call(this, _.first(list), newOptions);
     } else {
       if (options.success) {
         options.success(results);
@@ -2619,7 +3153,6 @@
   // Attach all inheritable methods to the Parse.Object prototype.
   _.extend(Parse.Object.prototype, Parse.Events,
            /** @lends Parse.Object.prototype */ {
-           
     _existed: false,
 
     /**
@@ -2633,22 +3166,31 @@
      * @return {Object}
      */
     toJSON: function() {
+      var json = this._toFullJSON();
+      _.each(["createdAt", "objectId", "updatedAt", "__type", "className"],
+             function(key) { delete json[key]; });
+      return json;
+    },
+
+    _toFullJSON: function(seenObjects) {
       var json = _.clone(this.attributes);
-      _.each(["createdAt", "objectId", "updatedAt"], function(key) {
-        delete json[key];
-      });
       Parse._each(json, function(val, key) {
-        json[key] = Parse._encode(val);
+        json[key] = Parse._encode(val, seenObjects);
       });
       Parse._each(this._operations, function(val, key) {
         json[key] = val;
       });
+      json.objectId = this.id;
+      json.createdAt = this.createdAt;
+      json.updatedAt = this.updatedAt;
+      json.__type = "Object";
+      json.className = this.className;
       return json;
     },
 
     /**
      * Updates _hashedJSON to reflect the current state of this object.
-     * Adds any changed hash values to the _dirty set.
+     * Adds any changed hash values to the set of pending changes.
      */
     _refreshCache: function() {
       var self = this;
@@ -2656,19 +3198,10 @@
         if (value instanceof Parse.Object) {
           value._refreshCache();
         } else if (_.isObject(value)) {
-          if (value.toJSON) {
-            value = value.toJSON();
-          }
-          var json = JSON.stringify(value);
-          if (self._hashedJSON[key] !== json) {
-            self._hashedJSON[key] = json;
-            self._dirty[key] = true;
+          if (self._resetCacheForKey(key)) {
+            self.set(key, new Parse.Op.Set(value), { silent: true });
           }
         }
-      });
-      // If any of these special keys get in the dirty list, take them out.
-      _.each(["createdAt", "objectId", "updatedAt"], function(key) {
-        delete self._dirty[key];
       });
     },
 
@@ -2681,13 +3214,16 @@
      */
     dirty: function(attr) {
       this._refreshCache();
+
+      var currentChanges = _.last(this._opSetQueue);
+
       if (attr) {
-        return (this._dirty[attr] ? true : false);
+        return (currentChanges[attr] ? true : false);
       }
       if (!this.id) {
         return true;
       }
-      if (_.keys(this._dirty).length > 0) {
+      if (_.keys(currentChanges).length > 0) {
         return true;
       }
       return false;
@@ -2718,17 +3254,16 @@
      * @param String attr The attribute to get the relation for.
      */
     relation: function(attr) {
-      var oldValue = this.get(attr);
-      if (oldValue) {
-        if (!(oldValue instanceof Parse.Relation)) {
-          throw attr + " does contain have a relation";
+      var value = this.get(attr);
+      if (value) {
+        if (!(value instanceof Parse.Relation)) {
+          throw "Called relation() on non-relation field " + attr;
         }
-        return oldValue;
+        value._ensureParentAndKey(this, attr);
+        return value;
+      } else {
+        return new Parse.Relation(this, attr);
       }
-
-      var returnValue = new Parse.Relation(this, attr);
-      this.set(attr, returnValue);
-      return returnValue;
     },
 
     /**
@@ -2741,7 +3276,7 @@
       }
       var val = this.attributes[attr];
       var escaped;
-      if (isNullOrUndefined(val)) {
+      if (Parse._isNullOrUndefined(val)) {
         escaped = '';
       } else {
         escaped = _.escape(val.toString());
@@ -2757,7 +3292,7 @@
      * @return {Boolean}
      */
     has: function(attr) {
-      return !isNullOrUndefined(this.attributes[attr]);
+      return !Parse._isNullOrUndefined(this.attributes[attr]);
     },
 
     /**
@@ -2780,32 +3315,158 @@
       });
     },
 
-    _handleSetOp: function(key, op) {
-      if (op.__op === 'Batch') {
-        var self = this;
-        var success = true;
-        Parse._each(op.ops, function(subOp) {
-          success = success && self._handleSetOp(key, subOp);
-        });
-      } else if (op.__op === 'Increment') {
-        this.attributes[key] = this.attributes[key] || 0;
-        this.attributes[key] += op.amount;
-        this._dirty[key] = true;
-      } else if (op.__op === 'AddRelation') {
-        var relationForAdd = this.relation(key);
-        relationForAdd.add(op.objects);
-        this._dirty[key] = true;
-      } else if (op.__op === 'RemoveRelation') {
-        var relationForDelete = this.relation(key);
-        relationForDelete.remove(op.objects);
-        this._dirty[key] = true;
-      } else if (op.__op === 'Delete') {
-        this._dirty[key] = true;
-        delete this.attributes[key];
+    /**
+     * Returns the json to be sent to the server.
+     */
+    _startSave: function() {
+      this._opSetQueue.push({});
+    },
+
+    /**
+     * If any save has been started since the current one running, process the
+     * next one in the queue.
+     */
+    _processSaveQueue: function() {
+      if (this._saveQueue && this._saveQueue.length > 0) {
+        var nextSave = _.first(this._saveQueue);
+        this._saveQueue = _.rest(this._saveQueue);
+        nextSave();
       } else {
-        return false;
+        this._saving = false;
       }
-      return true;
+    },
+
+    /**
+     * Called when a save fails because of an error. Any changes that were part
+     * of the save need to be merged with changes made after the save. This
+     * might throw an exception is you do conflicting operations. For example,
+     * if you do:
+     *   object.set("foo", "bar");
+     *   object.set("invalid field name", "baz");
+     *   object.save();
+     *   object.increment("foo");
+     * then this will throw when the save fails and the client tries to merge
+     * "bar" with the +1.
+     */
+    _cancelSave: function() {
+      var self = this;
+      var failedChanges = _.first(this._opSetQueue);
+      this._opSetQueue = _.rest(this._opSetQueue);
+      var nextChanges = _.first(this._opSetQueue);
+      Parse._each(failedChanges, function(op, key) {
+        var op1 = failedChanges[key];
+        var op2 = nextChanges[key];
+        if (op1 && op2) {
+          nextChanges[key] = op2._mergeWithPrevious(op1);
+        } else if (op1) {
+          nextChanges[key] = op1;
+        }
+      });
+      this._processSaveQueue();
+    },
+
+    /**
+     * Called when a save completes successfully. This merges the changes that
+     * were saved into the known server data, and overrides it with any data
+     * sent directly from the server.
+     */
+    _finishSave: function(serverData) {
+      var savedChanges = _.first(this._opSetQueue);
+      this._opSetQueue = _.rest(this._opSetQueue);
+      this._applyOpSet(savedChanges, this._serverData);
+      this._mergeMagicFields(serverData);
+      var self = this;
+      Parse._each(serverData, function(value, key) {
+        self._serverData[key] = Parse._decode(key, value);
+      });
+      this._rebuildAllEstimatedData();
+      this._processSaveQueue();
+    },
+
+    /**
+     * Called when a fetch or login is complete to set the known server data to
+     * the given object.
+     */
+    _finishFetch: function(serverData, hasData) {
+      this._mergeMagicFields(serverData);
+      var self = this;
+      Parse._each(serverData, function(value, key) {
+        self._serverData[key] = Parse._decode(key, value);
+      });
+      this._refreshCache();
+      this._hasData = hasData;
+      this._opSetQueue = [{}];
+      this._rebuildAllEstimatedData();
+    },
+
+    /**
+     * Applies the set of Parse.Op in opSet to the object target.
+     */
+    _applyOpSet: function(opSet, target) {
+      var self = this;
+      Parse._.each(opSet, function(change, key) {
+        target[key] = change._estimate(target[key], self, key);
+        if (target[key] === Parse.Op._UNSET) {
+          delete target[key];
+        }
+      });
+    },
+
+    /**
+     * Replaces the cached value for key with the current value.
+     * Returns true if the new value is different than the old value.
+     */
+    _resetCacheForKey: function(key) {
+      var value = this.attributes[key];
+      if (_.isObject(value) && !(value instanceof Parse.Object)) {
+        value = value.toJSON ? value.toJSON() : value;
+        var json = JSON.stringify(value);
+        if (this._hashedJSON[key] !== json) {
+          this._hashedJSON[key] = json;
+          return true;
+        }
+      }
+      return false;
+    },
+
+    /**
+     * Populates attributes[key] by starting with the last known data from the
+     * server, and applying all of the local changes that have been made to that
+     * key since then.
+     */
+    _rebuildEstimatedDataForKey: function(key) {
+      var self = this;
+      delete this.attributes[key];
+      if (this._serverData[key]) {
+        this.attributes[key] = this._serverData[key];
+      }
+      _.each(this._opSetQueue, function(opSet) {
+        var op = opSet[key];
+        if (op) {
+          self.attributes[key] = op._estimate(self.attributes[key], self, key);
+          if (self.attributes[key] === Parse.Op._UNSET) {
+            delete self.attributes[key];
+          } else {
+            self._resetCacheForKey(key);
+          }
+        }
+      });
+    },
+
+    /**
+     * Populates attributes by starting with the last known data from the
+     * server, and applying all of the local changes that have been made since
+     * then.
+     */
+    _rebuildAllEstimatedData: function() {
+      var self = this;
+      this.attributes = _.clone(this._serverData);
+      _.each(this._opSetQueue, function(opSet) {
+        self._applyOpSet(opSet, self.attributes);
+        _.each(opSet, function(op, key) {
+          self._resetCacheForKey(key);
+        });
+      });
     },
 
     /**
@@ -2830,7 +3491,7 @@
      *   });
      *
      *   game.set("finished", true);</pre></p>
-     * 
+     *
      * @param {String} key The key to set.
      * @param {} value The value to give it.
      * @param {Object} options A set of Backbone-like options for the set.
@@ -2842,7 +3503,7 @@
      */
     set: function(key, value, options) {
       var attrs, attr;
-      if (_.isObject(key) || isNullOrUndefined(key)) {
+      if (_.isObject(key) || Parse._isNullOrUndefined(key)) {
         attrs = key;
         Parse._each(attrs, function(v, k) {
           attrs[k] = Parse._decode(k, v);
@@ -2858,15 +3519,29 @@
       if (!attrs) {
         return this;
       }
-      
       if (attrs instanceof Parse.Object) {
         attrs = attrs.attributes;
       }
+
+      // If the unset option is used, every attribute should be a Unset.
       if (options.unset) {
-        Parse._each(attrs, function(unused_value, attr) {
-          attrs[attr] = undefined;
+        Parse._each(attrs, function(unused_value, key) {
+          attrs[key] = new Parse.Op.Unset();
         });
       }
+
+      // Apply all the attributes to get the estimated values.
+      var dataToValidate = _.clone(attrs);
+      var self = this;
+      Parse._each(dataToValidate, function(value, key) {
+        if (value instanceof Parse.Op) {
+          dataToValidate[key] = value._estimate(self.attributes[key],
+                                                self, key);
+          if (dataToValidate[key] === Parse.Op._UNSET) {
+            delete dataToValidate[key];
+          }
+        }
+      });
 
       // Run validation.
       if (!this._validate(attrs, options)) {
@@ -2875,15 +3550,11 @@
 
       this._mergeMagicFields(attrs);
 
-      var now = this.attributes;
+      options.changes = {};
       var escaped = this._escapedAttributes;
       var prev = this._previousAttributes || {};
-      var alreadySetting = this._setting;
-      this._changed = this._changed || {};
-      this._setting = true;
 
       // Update attributes.
-      var self = this;
       Parse._each(_.keys(attrs), function(attr) {
         var val = attrs[attr];
 
@@ -2894,47 +3565,44 @@
           val.parent = self;
         }
 
-        var handledOp = false;
-        if (_.isObject(val) && _.has(val, '__op')) {
-          handledOp = self._handleSetOp(attr, val);
-        } else {
-          if (!_.isEqual(now[attr], val)) {
-            delete escaped[attr];
-          }
-          if (options.unset) {
-            delete now[attr];
-            self._dirty[attr] = true;
-            self._operations[attr] = { __op: 'Delete' };
+        if (!(val instanceof Parse.Op)) {
+          val = new Parse.Op.Set(val);
+        }
+
+        // See if this change will actually have any effect.
+        var isRealChange = true;
+        if (val instanceof Parse.Op.Set &&
+            _.isEqual(self.attributes[attr], val.value)) {
+          isRealChange = false;
+        }
+
+        if (isRealChange) {
+          delete escaped[attr];
+          if (options.silent) {
+            self._silent[attr] = true;
           } else {
-            now[attr] = val;
-            self._dirty[attr] = true;
-            // If this field was previously scheduled for deletion, undo that.
-            if (_.isObject(self._operations[attr]) &&
-                self._operations[attr].__op === 'Delete') {
-              delete self._operations[attr];
-            }
+            options.changes[attr] = true;
           }
         }
-        if (self._changing && !_.isEqual(self._changed[attr], val)) {
-          self.trigger('change:' + attr, self, val, options);
-          self._moreChanges = true;
-        }
-        delete self._changed[attr];
-        if (!_.isEqual(prev[attr], val) ||
-            handledOp ||
-            (_.has(now, attr) !== _.has(prev, attr))) {
-          self._changed[attr] = val;
+
+        var currentChanges = _.last(self._opSetQueue);
+        currentChanges[attr] = val._mergeWithPrevious(currentChanges[attr]);
+        self._rebuildEstimatedDataForKey(attr);
+
+        if (isRealChange) {
+          self.changed[attr] = self.attributes[attr];
+          if (!options.silent) {
+            self._pending[attr] = true;
+          }
+        } else {
+          delete self.changed[attr];
+          delete self._pending[attr];
         }
       });
 
-      // Fire the `"change"` events, if the model has been changed.
-      if (!alreadySetting) {
-        if (!options.silent && this.hasChanged()) {
-          this.change(options);
-        }
-        this._setting = false;
+      if (!options.silent) {
+        this.change(options);
       }
-
       return this;
     },
 
@@ -2950,6 +3618,66 @@
     },
 
     /**
+     * Atomically increments the value of the given attribute the next time the
+     * object is saved. If no amount is specified, 1 is used by default.
+     *
+     * @param attr {String} The key.
+     * @param amount {Number} The amount to increment by.
+     */
+    increment: function(attr, amount) {
+      if (_.isUndefined(amount) || _.isNull(amount)) {
+        amount = 1;
+      }
+      return this.set(attr, new Parse.Op.Increment(amount));
+    },
+
+    /**
+     * Atomically add an object to the end of the array associated with a given
+     * key.
+     * @param attr {String} The key.
+     * @param item {} The item to add.
+     */
+    add: function(attr, item) {
+      return this.set(attr, new Parse.Op.Add([item]));
+    },
+
+    /**
+     * Atomically add an object to the array associated with a given key, only
+     * if it is not already present in the array. The position of the insert is
+     * not guaranteed.
+     *
+     * @param attr {String} The key.
+     * @param item {} The object to add.
+     */
+    addUnique: function(attr, item) {
+      return this.set(attr, new Parse.Op.AddUnique([item]));
+    },
+
+    /**
+     * Atomically remove all instances of an object from the array associated
+     * with a given key.
+     *
+     * @param attr {String} The key.
+     * @param item {} The object to remove.
+     */
+    remove: function(attr, item) {
+      return this.set(attr, new Parse.Op.Remove([item]));
+    },
+
+    /**
+     * Returns an instance of a subclass of Parse.Op describing what kind of
+     * modification has been performed on this field since the last time it was
+     * saved. For example, after calling object.increment("x"), calling
+     * object.op("x") would return an instance of Parse.Op.Increment.
+     *
+     * @param attr {String} The key.
+     * @returns {Parse.Op} The operation, or undefined if none.
+     */
+    op: function(attr) {
+      return _.last(this._opSetQueue)[attr];
+    },
+
+    /**
      * Clear all attributes on the model, firing <code>"change"</code> unless
      * you choose to silence it.
      */
@@ -2958,6 +3686,18 @@
       options.unset = true;
       var keysToClear = _.extend(this.attributes, this._operations);
       return this.set(keysToClear, options);
+    },
+
+    /**
+     * Returns a JSON-encoded set of operations to be sent with the next save
+     * request.
+     */
+    _getSaveJSON: function() {
+      var json = _.clone(_.first(this._opSetQueue));
+      Parse._each(json, function(op, key) {
+        json[key] = op.toJSON();
+      });
+      return json;
     },
 
     /**
@@ -2970,12 +3710,8 @@
       var model = this;
       var success = options.success;
       options.success = function(resp, status, xhr) {
-        if (!model.set(model.parse(resp, status, xhr), options)) {
-          return false;
-        }
+        model._finishFetch(model.parse(resp, status, xhr), true);
         if (success) {
-          model._refreshCache();
-          model._dirty = {};
           success(model, resp);
         }
       };
@@ -3008,12 +3744,12 @@
      *       // The save failed.  Error is an instance of Parse.Error.
      *     }
      *   });</pre>
-     * 
+     *
      * @see Parse.Error
      */
     save: function(arg1, arg2, arg3) {
       var i, attrs, current, options, saved;
-      if (_.isObject(arg1) || isNullOrUndefined(arg1)) {
+      if (_.isObject(arg1) || Parse._isNullOrUndefined(arg1)) {
         attrs = arg1;
         options = arg2;
       } else {
@@ -3056,34 +3792,22 @@
 
       var model = this;
 
-      // A function that will re-call this function with the same arguments.
-      // This will be used in the loop below, but JSLint insists it go here.
-      var saveThisModel = function(child, resp) {
-        model.save(null, oldOptions);
-      };
-
       // If there is any unsaved child, save it first.
       model._refreshCache();
-      var keys = _.keys(model.attributes);
-      for (i = 0; i < keys.length; ++i) {
-        var key = keys[i];
-        var child = model.attributes[key];
-        if (child instanceof Parse.Object) {
-          if (child.dirty()) {
-            // This child is unsaved, so save it, and have the callback try to
-            // save this model again.
-            newOptions.success = saveThisModel;
-            child.save(null, newOptions);
-            return this;
+      var unsavedChildren = Parse.Object._findUnsavedChildren(model.attributes);
+      if (unsavedChildren.length > 0) {
+        Parse.Object.saveAll(unsavedChildren, {
+          success: function(results) {
+            model.save(null, oldOptions);
+          },
+          error: function(error) {
+            if (options.error) {
+              options.error.apply(this, arguments);
+            }
           }
-        } else if (child instanceof Parse.Relation && child._dirty()) {
-          model._dirty[key] = true;
-        }
+        });
+        return this;
       }
-
-      // Record what was saved, so we can update dirty fields correctly.
-      var savedData = _.clone(model.attributes);
-      var savedOperations = _.clone(model._operations);
 
       /** ignore */
       newOptions.success = function(resp, status, xhr) {
@@ -3091,55 +3815,52 @@
         if (newOptions.wait) {
           serverAttrs = _.extend(attrs || {}, serverAttrs);
         }
-        if (!model.set(serverAttrs, newOptions)) {
-          return false;
-        }
 
-        var keys = _.keys(model.attributes);
-        Parse._each(model.attributes, function(child, key) {
-          if (child instanceof Parse.Relation) {
-            child._clearUpdates();
-          }
-        });
+        model._finishSave(serverAttrs);
 
         if (oldOptions.success) {
-          model._refreshCache();
-          Parse._each(savedData, function(savedValue, savedKey) {
-            if (savedValue === model.get(savedKey)) {
-              delete model._dirty[savedKey];
-            }
-          });
-          Parse._each(savedOperations, function(unusedValue, savedKey) {
-            delete model._dirty[savedKey];
-          });
           oldOptions.success(model, resp);
         } else {
           model.trigger('sync', model, resp, newOptions);
         }
       };
-      newOptions.error = Parse.Object._wrapError(oldOptions.error, model,
+
+      newOptions.error = function() {
+        model._cancelSave();
+        if (oldOptions.error) {
+          oldOptions.error.apply(this, arguments);
+        }
+      };
+
+      newOptions.error = Parse.Object._wrapError(newOptions.error, model,
                                                  newOptions);
 
-      var method = this.id ? 'PUT' : 'POST';
-      var json = this.toJSON();
-      // Remove fields that aren't dirty.
-      model._refreshCache();
-      Parse._each(json, function(value, key) {
-        if (!model._dirty[key]) {
-          delete json[key];
-        }
-      });
+      this._startSave();
 
-      var route = "classes";
-      var className = this.className;
-      if (this.className === "_User" && !this.id) {
-        // Special-case user sign-up.
-        route = "users";
-        className = null;
-      }
-      Parse._request(route, className, this.id, method, json, newOptions);
-      if (newOptions.wait) {
-        this.set(current, silentOptions);
+      var doSave = function() {
+        var method = model.id ? 'PUT' : 'POST';
+
+        var json = model._getSaveJSON();
+
+        var route = "classes";
+        var className = model.className;
+        if (model.className === "_User" && !model.id) {
+          // Special-case user sign-up.
+          route = "users";
+          className = null;
+        }
+        Parse._request(route, className, model.id, method, json, newOptions);
+        if (newOptions.wait) {
+          model.set(current, silentOptions);
+        }
+      };
+
+      if (this._saving) {
+        this._saveQueue = this._saveQueue || [];
+        this._saveQueue.push(doSave);
+      } else {
+        this._saving = true;
+        doSave();
       }
 
       return this;
@@ -3218,7 +3939,53 @@
     isNew: function() {
       return !this.id;
     },
-    
+
+    /**
+     * Call this method to manually fire a `"change"` event for this model and
+     * a `"change:attribute"` event for each changed attribute.
+     * Calling this will cause all objects observing the model to update.
+     */
+    change: function(options) {
+      options = options || {};
+      var changing = this._changing;
+      this._changing = true;
+
+      // Silent changes become pending changes.
+      var self = this;
+      Parse._each(this._silent, function(attr) {
+        self._pending[attr] = true;
+      });
+
+      // Silent changes are triggered.
+      var changes = _.extend({}, options.changes, this._silent);
+      this._silent = {};
+      Parse._each(changes, function(unused_value, attr) {
+        self.trigger('change:' + attr, self, self.get(attr), options);
+      });
+      if (changing) {
+        return this;
+      }
+
+      // This is to get around lint not letting us make a function in a loop.
+      var deleteChanged = function(attr) {
+        if (!self._pending[attr] && !self._silent[attr]) {
+          delete self.changed[attr];
+        }
+      };
+
+      // Continue firing `"change"` events while there are pending changes.
+      while (!_.isEmpty(this._pending)) {
+        this._pending = {};
+        this.trigger('change', this, options);
+        // Pending and silent changes still remain.
+        Parse._each(this.changed, deleteChanged);
+        self._previousAttributes = _.clone(this.attributes);
+      }
+
+      this._changing = false;
+      return this;
+    },
+
     /**
      * Returns true if this object was created by the Parse server when the
      * object might have already been there (e.g. in the case of a Facebook
@@ -3226,32 +3993,6 @@
      */
     existed: function() {
       return this._existed;
-    },
-
-    /**
-     * Call this method to manually fire a <code>"change"</code> event for this
-     * model and a <code>"change:attribute"</code> event for each changed
-     * attribute.  Calling this will cause all objects observing the model to
-     * update.
-     */
-    change: function(options) {
-      var self = this;
-      if (this._changing || !this.hasChanged()) {
-        return this;
-      }
-      this._changing = true;
-      this._moreChanges = true;
-      Parse._each(this._changed, function(value, attr) {
-        self.trigger('change:' + attr, self, value, options);
-      });
-      while (this._moreChanges) {
-        this._moreChanges = false;
-        this.trigger('change', this, options);
-      }
-      this._previousAttributes = _.clone(this.attributes);
-      delete this._changed;
-      this._changing = false;
-      return this;
     },
 
     /**
@@ -3324,7 +4065,7 @@
      * You should not call this function directly unless you subclass
      * <code>Parse.Object</code>, in which case you can override this method
      * to provide additional validation on <code>set</code> and
-     * <code>save</code>.  Your implementation should return 
+     * <code>save</code>.  Your implementation should return
      *
      * @param {Object} attrs The current data to validate.
      * @param {Object} options A Backbone-like options object.
@@ -3483,7 +4224,6 @@
   /**
    * Wrap an optional error callback with a fallback error event.
    */
-  // Wrap an optional error callback with a fallback error event.
   Parse.Object._wrapError = function(onError, originalModel, options) {
     return function(model, response) {
       if (model !== originalModel) {
@@ -3503,6 +4243,32 @@
       }
     };
   };
+
+  Parse.Object._findUnsavedChildren = function(object) {
+    var results = [];
+    if (object instanceof Parse.Object) {
+      object._refreshCache();
+      if (object.dirty()) {
+        results = [object];
+      }
+      results.push.apply(results,
+                         Parse.Object._findUnsavedChildren(object.attributes));
+    } else if (object instanceof Parse.Relation) {
+      // Nothing needs to be done, but we don't want to recurse into the
+      // relation's parent infinitely, so we catch this case.
+      var unused = null;
+    } else if (_.isArray(object)) {
+      _.each(object, function(child) {
+        results.push.apply(results, Parse.Object._findUnsavedChildren(child));
+      });
+    } else if (_.isObject(object)) {
+      Parse._each(object, function(child) {
+        results.push.apply(results, Parse.Object._findUnsavedChildren(child));
+      });
+    }
+    return results;
+  };
+
 }(this));
 
 /*global localStorage: false */
@@ -3521,13 +4287,15 @@
    * <p>Roles must have a name (which cannot be changed after creation of the
    * role), and must specify an ACL.</p>
    * @class
+   * A Parse.Role is a local representation of a role persisted to the Parse
+   * cloud.
    */
   Parse.Role = Parse.Object.extend("_Role", /** @lends Parse.Role.prototype */ {
     // Instance Methods
-    
+
     /**
      * Constructs a new ParseRole with the given name and ACL.
-     * 
+     *
      * @param {String} name The name of the Role to create.
      * @param {Parse.ACL} acl The ACL for this role. Roles must have an ACL.
      */
@@ -3540,28 +4308,28 @@
         Parse.Object.prototype.constructor.call(this, name, acl);
       }
     },
-    
+
     /**
      * Gets the name of the role.  You can alternatively call role.get("name")
-     * 
+     *
      * @return {String} the name of the role.
      */
     getName: function() {
       return this.get("name");
     },
-    
+
     /**
      * Sets the name for a role. This value must be set before the role has
      * been saved to the server, and cannot be set once the role has been
      * saved.
-     * 
+     *
      * <p>
      *   A role's name can only contain alphanumeric characters, _, -, and
      *   spaces.
      * </p>
      *
      * <p>This is equivalent to calling role.set("name", name)</p>
-     * 
+     *
      * @param {String} name The name of the role.
      * @param {Object} options Standard options object with success and error
      *     callbacks.
@@ -3569,37 +4337,37 @@
     setName: function(name, options) {
       return this.set("name", name, options);
     },
-    
+
     /**
      * Gets the Parse.Relation for the Parse.Users that are direct
      * children of this role. These users are granted any privileges that this
      * role has been granted (e.g. read or write access through ACLs). You can
      * add or remove users from the role through this relation.
-     * 
+     *
      * <p>This is equivalent to calling role.relation("users")</p>
-     * 
+     *
      * @return {Parse.Relation} the relation for the users belonging to this
      *     role.
      */
     getUsers: function() {
       return this.relation("users");
     },
-    
+
     /**
      * Gets the Parse.Relation for the Parse.Roles that are direct
      * children of this role. These roles' users are granted any privileges that
      * this role has been granted (e.g. read or write access through ACLs). You
      * can add or remove child roles from this role through this relation.
-     * 
+     *
      * <p>This is equivalent to calling role.relation("roles")</p>
-     * 
+     *
      * @return {Parse.Relation} the relation for the roles belonging to this
      *     role.
      */
     getRoles: function() {
       return this.relation("roles");
     },
-    
+
     /**
      * @ignore
      */
@@ -3638,14 +4406,9 @@
   var Parse = root.Parse;
   var _ = Parse._;
 
-  // Helper function to check null or undefined.
-  var isNullOrUndefined = function(x) {
-    return _.isNull(x) || _.isUndefined(x);
-  };
-
   /**
    * Creates a new instance with the given models and options.  Typically, you
-   * will not call this method directory, but will instead make a subclass using
+   * will not call this method directly, but will instead make a subclass using
    * <code>Parse.Collection.extend</code>.
    *
    * @param {Array} models An array of instances of <code>Parse.Object</code>.
@@ -3690,7 +4453,7 @@
 
     // The default model for a collection is just a Parse.Object.
     // This should be overridden in most cases.
-    
+
     model: Parse.Object,
 
     /**
@@ -3730,7 +4493,7 @@
                           "to a collection twice");
         }
         id = model.id;
-        if (!isNullOrUndefined(id) && (ids[id] || this._byId[id])) {
+        if (!Parse._isNullOrUndefined(id) && (ids[id] || this._byId[id])) {
           throw new Error("Duplicate id: can't add the same model " +
                           "to a collection twice");
         }
@@ -4075,7 +4838,7 @@
   var eventSplitter = /^(\S+)\s*(.*)$/;
 
   // List of view options to be merged as properties.
-  
+
   var viewOptions = ['model', 'collection', 'el', 'id', 'attributes',
                      'className', 'tagName'];
 
@@ -4244,8 +5007,8 @@
 
   /**
    * @function
-   * @param {Object} instanceProps Instance properties for the collection.
-   * @param {Object} classProps Class properies for the collection.
+   * @param {Object} instanceProps Instance properties for the view.
+   * @param {Object} classProps Class properies for the view.
    * @return {Class} A new subclass of <code>Parse.View</code>.
    */
   Parse.View.extend = Parse._extend;
@@ -4284,12 +5047,15 @@
       }
       Parse.User.__super__._mergeMagicFields.call(this, attrs);
     },
-    
+
     /**
      * Removes null values from authData (which exist temporarily for
      * unlinking)
      */
     _cleanupAuthData: function() {
+      if (!this.isCurrent()) {
+        return;
+      }
       var authData = this.get('authData');
       if (!authData) {
         return;
@@ -4299,10 +5065,8 @@
           delete authData[key];
         }
       });
-      var dirty = this._dirty;
-      delete dirty.authData;
     },
-    
+
     /**
      * Synchronizes authData for all providers.
      */
@@ -4311,18 +5075,21 @@
       if (!authData) {
         return;
       }
-      
+
       var self = this;
       _.each(this.get('authData'), function(value, key) {
         self._synchronizeAuthData(key);
       });
     },
-    
+
     /**
      * Synchronizes auth data for a provider (e.g. puts the access token in the
      * right place to be used by the Facebook SDK).
      */
     _synchronizeAuthData: function(provider) {
+      if (!this.isCurrent()) {
+        return;
+      }
       var authType;
       if (_.isString(provider)) {
         authType = provider;
@@ -4342,18 +5109,20 @@
 
     _handleSaveResult: function(makeCurrent) {
       // Clean up and synchronize the authData object, removing any unset values
+      if (makeCurrent) {
+        this._isCurrentUser = true;
+      }
       this._cleanupAuthData();
       this._synchronizeAllAuthData();
       // Don't keep the password around.
-      this.unset("password");
-      var dirty = this._dirty;
-      delete dirty.password;
+      delete this._serverData.password;
+      this._rebuildEstimatedDataForKey("password");
       this._refreshCache();
       if (makeCurrent || this.isCurrent()) {
         Parse.User._saveCurrentUser(this);
       }
     },
-    
+
     /**
      * Unlike in the Android/iOS SDKs, logInWith is unnecessary, since you can
      * call linkWith on the user (even if it doesn't exist yet on the server).
@@ -4370,8 +5139,7 @@
         var authData = this.get('authData') || {};
         authData[authType] = options.authData;
         this.set('authData', authData);
-        
-        
+
         // Overridden so that the user can be made the current user.
         var newOptions = _.clone(options);
         newOptions.success = function(model) {
@@ -4399,7 +5167,7 @@
         });
       }
     },
-    
+
     /**
      * Unlinks a user from a service.
      */
@@ -4422,7 +5190,7 @@
       };
       return this._linkWith(provider, newOptions);
     },
-    
+
     /**
      * Checks whether a user is linked to a service.
      */
@@ -4436,7 +5204,7 @@
       var authData = this.get('authData') || {};
       return !!authData[authType];
     },
-    
+
     /**
      * Deauthenticates all providers.
      */
@@ -4450,12 +5218,15 @@
         self._logOutWith(key);
       });
     },
-    
+
     /**
      * Deauthenticates a single provider (e.g. removing access tokens from the
      * Facebook SDK).
      */
     _logOutWith: function(provider) {
+      if (!this.isCurrent()) {
+        return;
+      }
       if (_.isString(provider)) {
         provider = Parse.User._authProviders[provider];
       }
@@ -4532,9 +5303,7 @@
       var newOptions = _.clone(options);
       newOptions.success = function(resp, status, xhr) {
         var serverAttrs = model.parse(resp, status, xhr);
-        if (!model.set(serverAttrs, newOptions)) {
-          return false;
-        }
+        model._finishFetch(serverAttrs);
         model._handleSaveResult(true);
         if (options.success) {
           options.success(model, resp);
@@ -4657,7 +5426,7 @@
 
     // The localStorage key suffix that the current user is stored under.
     _CURRENT_USER_KEY: "currentUser",
-    
+
     // The mapping of auth provider names to actual providers
     _authProviders: {},
 
@@ -4703,8 +5472,7 @@
      */
     logIn: function(username, password, options) {
       var user = Parse.Object._create("_User");
-      user.set("username", username);
-      user.set("password", password);
+      user._finishFetch({ username: username, password: password });
       user.logIn(options);
     },
 
@@ -4715,8 +5483,8 @@
      */
     logOut: function() {
       if (Parse.User._currentUser !== null) {
-        Parse.User._currentUser._isCurrentUser = false;
         Parse.User._currentUser._logOutWithAll();
+        Parse.User._currentUser._isCurrentUser = false;
       }
       Parse.User._currentUserMatchesDisk = true;
       Parse.User._currentUser = null;
@@ -4752,7 +5520,7 @@
       }
 
       if (Parse.User._currentUserMatchesDisk) {
-        
+
         return Parse.User._currentUser;
       }
 
@@ -4762,7 +5530,7 @@
       var userData = Ti.App.Properties.getString(Parse._getParsePath(
           Parse.User._CURRENT_USER_KEY));
       if (!userData) {
-        
+
         return null;
       }
       Parse.User._currentUser = new Parse.Object._create("_User");
@@ -4799,7 +5567,7 @@
           Parse._getParsePath(Parse.User._CURRENT_USER_KEY),
           JSON.stringify(json));
     },
-    
+
     _registerAuthenticationProvider: function(provider) {
       Parse.User._authProviders[provider.getAuthType()] = provider;
       // Synchronize the current user with the auth provider.
@@ -4807,7 +5575,7 @@
         Parse.User.current()._synchronizeAuthData(provider.getAuthType());
       }
     },
-    
+
     _logInWith: function(provider, options) {
       var user = new Parse.User();
       return user._linkWith(provider, options);
@@ -4834,7 +5602,7 @@
    * <code>find</code> method. For example, this sample code fetches all objects
    * of class <code>MyClass</code>. It calls a different function depending on
    * whether the fetch succeeded or not.
-   * 
+   *
    * <pre>
    * var query = new Parse.Query(MyClass);
    * query.find({
@@ -4846,12 +5614,12 @@
    *     // error is an instance of Parse.Error.
    *   }
    * });</pre></p>
-   * 
+   *
    * <p>A Parse.Query can also be used to retrieve a single object whose id is
    * known, through the get method. For example, this sample code fetches an
    * object of class <code>MyClass</code> and id <code>myId</code>. It calls a
    * different function depending on whether the fetch succeeded or not.
-   * 
+   *
    * <pre>
    * var query = new Parse.Query(MyClass);
    * query.get(myId, {
@@ -4863,7 +5631,7 @@
    *     // error is an instance of Parse.Error.
    *   }
    * });</pre></p>
-   * 
+   *
    * <p>A Parse.Query can also be used to count the number of objects that match
    * the query without retrieving all of those objects. For example, this
    * sample code counts the number of objects of the class <code>MyClass</code>
@@ -4904,8 +5672,27 @@
      * @param {Object} options A Backbone-style options object.
      */
     get: function(objectId, options) {
-      var object = new this.objectClass({objectId: objectId});
-      object.fetch(options);
+      var self = this;
+      var success = options.success || function() {};
+      var error = options.error || function() {};
+
+      /** ignore */
+      var ajaxOptions = {
+        error: function(errorObject) {
+          error(null, errorObject);
+        },
+        success: function(response) {
+          if (response) {
+            success(response);
+          } else {
+            error(null, new Parse.Error(Parse.Error.OBJECT_NOT_FOUND,
+                                        "Object not found."));
+          }
+        }
+      };
+
+      self.equalTo('objectId', objectId);
+      self.first(ajaxOptions);
     },
 
     /**
@@ -4941,16 +5728,15 @@
      */
     find: function(options) {
       var self = this;
-      var success = options.success;
+      var success = options.success || function() {};
 
       /** ignore */
       var ajaxOptions = {
         error: options.error,
         success: function(response) {
           success(_.map(response.results, function(json) {
-            var obj = new self.objectClass(json);
-            obj._refreshCache();
-            obj._dirty = {};
+            var obj = new self.objectClass();
+            obj._finishFetch(json, true);
             return obj;
           }));
         }
@@ -4971,7 +5757,7 @@
      */
     count: function(options) {
       var self = this;
-      var success = options.success;
+      var success = options.success || function() {};
 
       /** ignore */
       var ajaxOptions = {
@@ -4999,16 +5785,15 @@
     */
     first: function(options) {
       var self = this;
-      var success = options.success;
+      var success = options.success || function() {};
 
       /** ignore */
       var ajaxOptions = {
         error: options.error,
         success: function(response) {
           success(_.map(response.results, function(json) {
-            var obj = new self.objectClass(json);
-            obj._refreshCache();
-            obj._dirty = {};
+            var obj = new self.objectClass();
+            obj._finishFetch(json, true);
             return obj;
           })[0]);
         }
@@ -5195,7 +5980,7 @@
     matches: function(key, regex, modifiers) {
       this._addCondition(key, "$regex", regex);
       if (!modifiers) { modifiers = ""; }
-      // Javascript regex options support mig as inline options but store them 
+      // Javascript regex options support mig as inline options but store them
       // as properties of the object. We support mi & should migrate them to
       // modifiers
       if (regex.ignoreCase) { modifiers += 'i'; }
@@ -5303,7 +6088,7 @@
 
     /**
      * Sorts the results in ascending order by the given key.
-     * 
+     *
      * @param {String} key The key to order by.
      * @return {Parse.Query} Returns the query, so you can chain this call.
      */
@@ -5314,7 +6099,7 @@
 
     /**
      * Sorts the results in descending order by the given key.
-     * 
+     *
      * @param {String} key The key to order by.
      * @return {Parse.Query} Returns the query, so you can chain this call.
      */
@@ -5382,6 +6167,28 @@
     },
 
     /**
+     * Add a constraint to the query that requires a particular key's
+     * coordinates be contained within a given rectangular geographic bounding
+     * box.
+     * @param {String} key The key to be constrained.
+     * @param {Parse.GeoPoint} southwest
+     *     The lower-left inclusive corner of the box.
+     * @param {Parse.GeoPoint} northeast
+     *     The upper-right inclusive corner of the box.
+     * @return {Parse.Query} Returns the query, so you can chain this call.
+     */
+    withinGeoBox: function(key, southwest, northeast) {
+      if (!(southwest instanceof Parse.GeoPoint)) {
+        southwest = new Parse.GeoPoint(southwest);
+      }
+      if (!(northeast instanceof Parse.GeoPoint)) {
+        northeast = new Parse.GeoPoint(northeast);
+      }
+      this._addCondition(key, '$within', { '$box': [southwest, northeast] });
+      return this;
+    },
+
+    /**
      * Include nested Parse.Objects for the provided key.  You can use dot
      * notation to specify which fields in the included object are also fetch.
      * @param {String} key The name of the key to include.
@@ -5421,26 +6228,26 @@
   var _ = Parse._;
 
   var PUBLIC_KEY = "*";
-  
+
   var initialized = false;
   var requestedPermissions;
   var provider = {
     authenticate: function(options) {
       var self = this;
       Ti.Facebook.authorize();
-      
+
       Ti.Facebook.addEventListener('login', function(response) {
-        
-        if (response.success) 
-        {     
-          if (options.success) 
-          {           
+
+        if (response.success)
+        {
+          if (options.success)
+          {
               options.success(self, {
                 id: response.data.id,
                 access_token: Ti.Facebook.accessToken,
                 expiration_date: Ti.Facebook.expirationDate
               });
-              
+
             }
         } else {
           if (options.error) {
@@ -5448,8 +6255,8 @@
           }
         }
       });
-      
-      
+
+
       /* FB.login(function(response) {
         if (response.authResponse) {
           if (options.success) {
@@ -5526,10 +6333,10 @@
       Parse.User._registerAuthenticationProvider(provider);
       initialized = true;
     },
-    
+
     /**
      * Gets whether the user has their account linked to Facebook.
-     * 
+     *
      * @param {Parse.User} user User to check for a facebook link.
      *     The user must be logged in on this device.
      * @return {Boolean} <code>true</code> if the user has their account
@@ -5538,12 +6345,12 @@
     isLinked: function(user) {
       return user._isLinked("facebook");
     },
-    
+
     /**
      * Logs in a user using Facebook. This method delegates to the Facebook
      * SDK to authenticate the user, and then automatically logs in (or
      * creates, in the case where it is a new user) a Parse.User.
-     * 
+     *
      * @param {String} permissions The permissions required for Facebook
      *    log in.  This is a comma-separated string of permissions.
      * @param {Object} options Standard options object with success and error
@@ -5557,7 +6364,7 @@
       // requestedPermissions = permissions;
       return Parse.User._logInWith("facebook", options);
     },
-    
+
     /**
      * Links Facebook to an existing PFUser. This method delegates to the
      * Facebook SDK to authenticate the user, and then automatically links
@@ -5577,10 +6384,10 @@
       requestedPermissions = permissions;
       return user._linkWith("facebook", options);
     },
-    
+
     /**
-     * Unlinks the Parse.User from a Facebook account. 
-     * 
+     * Unlinks the Parse.User from a Facebook account.
+     *
      * @param {Parse.User} user User to unlink from Facebook. This must be the
      *     current user.
      * @param {Object} options Standard options object with success and error
@@ -5593,5 +6400,392 @@
       return user._unlinkFrom("facebook", options);
     }
   };
-  
+
+/****************************************************************************
+* NEED A GENIUS TO WORK OUT THE WINDOW HANDLERS HERE
+* ==================================================
+*****************************************************************************/
+}(this));
+
+/*global _: false, document: false, window: false, navigator: false */
+(function(root) {
+  root.Parse = root.Parse || {};
+  var Parse = root.Parse;
+  var _ = Parse._;
+
+  /**
+   * History serves as a global router (per frame) to handle hashchange
+   * events or pushState, match the appropriate route, and trigger
+   * callbacks. You shouldn't ever have to create one of these yourself
+   * — you should use the reference to <code>Parse.history</code>
+   * that will be created for you automatically if you make use of
+   * Routers with routes.
+   * @class
+   *
+   * <p>A fork of Backbone.History, provided for your convenience.  If you
+   * use this class, you must also include jQuery, or another library
+   * that provides a jQuery-compatible $ function.  For more information,
+   * see the <a href="http://documentcloud.github.com/backbone/#History">
+   * Backbone documentation</a>.</p>
+   */
+  Parse.History = function() {
+    this.handlers = [];
+    _.bindAll(this, 'checkUrl');
+  };
+
+  // Cached regex for cleaning leading hashes and slashes .
+  var routeStripper = /^[#\/]/;
+
+  // Cached regex for detecting MSIE.
+  var isExplorer = /msie [\w.]+/;
+
+  // Has the history handling already been started?
+  Parse.History.started = false;
+
+  // Set up all inheritable **Parse.History** properties and methods.
+  _.extend(Parse.History.prototype, Parse.Events,
+           /** @lends Parse.History.prototype */ {
+
+    // The default interval to poll for hash changes, if necessary, is
+    // twenty times a second.
+    interval: 50,
+
+    // Gets the true hash value. Cannot use location.hash directly due to bug
+    // in Firefox where location.hash will always be decoded.
+    getHash: function(windowOverride) {
+      var loc = windowOverride ? windowOverride.location : window.location;
+      var match = loc.href.match(/#(.*)$/);
+      return match ? match[1] : '';
+    },
+
+    // Get the cross-browser normalized URL fragment, either from the URL,
+    // the hash, or the override.
+    getFragment: function(fragment, forcePushState) {
+      if (Parse._isNullOrUndefined(fragment)) {
+        if (this._hasPushState || forcePushState) {
+          fragment = window.location.pathname;
+          var search = window.location.search;
+          if (search) {
+            fragment += search;
+          }
+        } else {
+          fragment = this.getHash();
+        }
+      }
+      if (!fragment.indexOf(this.options.root)) {
+        fragment = fragment.substr(this.options.root.length);
+      }
+      return fragment.replace(routeStripper, '');
+    },
+
+    /**
+     * Start the hash change handling, returning `true` if the current
+     * URL matches an existing route, and `false` otherwise.
+     */
+    start: function(options) {
+      if (Parse.History.started) {
+        throw new Error("Parse.history has already been started");
+      }
+      Parse.History.started = true;
+
+      // Figure out the initial configuration. Do we need an iframe?
+      // Is pushState desired ... is it available?
+      this.options = _.extend({}, {root: '/'}, this.options, options);
+      this._wantsHashChange = this.options.hashChange !== false;
+      this._wantsPushState = !!this.options.pushState;
+      this._hasPushState = !!(this.options.pushState &&
+                              window.history &&
+                              window.history.pushState);
+      var fragment = this.getFragment();
+      var docMode = document.documentMode;
+      var oldIE = (isExplorer.exec(navigator.userAgent.toLowerCase()) &&
+                   (!docMode || docMode <= 7));
+
+      if (oldIE) {
+        this.iframe = Parse.$('<iframe src="javascript:0" tabindex="-1" />')
+                      .hide().appendTo('body')[0].contentWindow;
+        this.navigate(fragment);
+      }
+
+      // Depending on whether we're using pushState or hashes, and whether
+      // 'onhashchange' is supported, determine how we check the URL state.
+      if (this._hasPushState) {
+        Parse.$(window).bind('popstate', this.checkUrl);
+      } else if (this._wantsHashChange &&
+                 ('onhashchange' in window) &&
+                 !oldIE) {
+        Parse.$(window).bind('hashchange', this.checkUrl);
+      } else if (this._wantsHashChange) {
+        this._checkUrlInterval = window.setInterval(this.checkUrl,
+                                                    this.interval);
+      }
+
+      // Determine if we need to change the base url, for a pushState link
+      // opened by a non-pushState browser.
+      this.fragment = fragment;
+      var loc = window.location;
+      var atRoot  = loc.pathname === this.options.root;
+
+      // If we've started off with a route from a `pushState`-enabled browser,
+      // but we're currently in a browser that doesn't support it...
+      if (this._wantsHashChange &&
+          this._wantsPushState &&
+          !this._hasPushState &&
+          !atRoot) {
+        this.fragment = this.getFragment(null, true);
+        window.location.replace(this.options.root + '#' + this.fragment);
+        // Return immediately as browser will do redirect to new url
+        return true;
+
+      // Or if we've started out with a hash-based route, but we're currently
+      // in a browser where it could be `pushState`-based instead...
+      } else if (this._wantsPushState &&
+                 this._hasPushState &&
+                 atRoot &&
+                 loc.hash) {
+        this.fragment = this.getHash().replace(routeStripper, '');
+        window.history.replaceState({}, document.title,
+            loc.protocol + '//' + loc.host + this.options.root + this.fragment);
+      }
+
+      if (!this.options.silent) {
+        return this.loadUrl();
+      }
+    },
+
+    // Disable Parse.history, perhaps temporarily. Not useful in a real app,
+    // but possibly useful for unit testing Routers.
+    stop: function() {
+      Parse.$(window).unbind('popstate', this.checkUrl)
+                     .unbind('hashchange', this.checkUrl);
+      window.clearInterval(this._checkUrlInterval);
+      Parse.History.started = false;
+    },
+
+    // Add a route to be tested when the fragment changes. Routes added later
+    // may override previous routes.
+    route: function(route, callback) {
+      this.handlers.unshift({route: route, callback: callback});
+    },
+
+    // Checks the current URL to see if it has changed, and if it has,
+    // calls `loadUrl`, normalizing across the hidden iframe.
+    checkUrl: function(e) {
+      var current = this.getFragment();
+      if (current === this.fragment && this.iframe) {
+        current = this.getFragment(this.getHash(this.iframe));
+      }
+      if (current === this.fragment) {
+        return false;
+      }
+      if (this.iframe) {
+        this.navigate(current);
+      }
+      if (!this.loadUrl()) {
+       this.loadUrl(this.getHash());
+      }
+    },
+
+    // Attempt to load the current URL fragment. If a route succeeds with a
+    // match, returns `true`. If no defined routes matches the fragment,
+    // returns `false`.
+    loadUrl: function(fragmentOverride) {
+      var fragment = this.fragment = this.getFragment(fragmentOverride);
+      var matched = _.any(this.handlers, function(handler) {
+        if (handler.route.test(fragment)) {
+          handler.callback(fragment);
+          return true;
+        }
+      });
+      return matched;
+    },
+
+    // Save a fragment into the hash history, or replace the URL state if the
+    // 'replace' option is passed. You are responsible for properly URL-encoding
+    // the fragment in advance.
+    //
+    // The options object can contain `trigger: true` if you wish to have the
+    // route callback be fired (not usually desirable), or `replace: true`, if
+    // you wish to modify the current URL without adding an entry to the
+    // history.
+    navigate: function(fragment, options) {
+      if (!Parse.History.started) {
+        return false;
+      }
+      if (!options || options === true) {
+        options = {trigger: options};
+      }
+      var frag = (fragment || '').replace(routeStripper, '');
+      if (this.fragment === frag) {
+        return;
+      }
+
+      // If pushState is available, we use it to set the fragment as a real URL.
+      if (this._hasPushState) {
+        if (frag.indexOf(this.options.root) !== 0) {
+          frag = this.options.root + frag;
+        }
+        this.fragment = frag;
+        var replaceOrPush = options.replace ? 'replaceState' : 'pushState';
+        window.history[replaceOrPush]({}, document.title, frag);
+
+      // If hash changes haven't been explicitly disabled, update the hash
+      // fragment to store history.
+      } else if (this._wantsHashChange) {
+        this.fragment = frag;
+        this._updateHash(window.location, frag, options.replace);
+        if (this.iframe &&
+            (frag !== this.getFragment(this.getHash(this.iframe)))) {
+          // Opening and closing the iframe tricks IE7 and earlier
+          // to push a history entry on hash-tag change.
+          // When replace is true, we don't want this.
+          if (!options.replace) {
+            this.iframe.document.open().close();
+          }
+          this._updateHash(this.iframe.location, frag, options.replace);
+        }
+
+      // If you've told us that you explicitly don't want fallback hashchange-
+      // based history, then `navigate` becomes a page refresh.
+      } else {
+        window.location.assign(this.options.root + fragment);
+      }
+      if (options.trigger) {
+        this.loadUrl(fragment);
+      }
+    },
+
+    // Update the hash location, either replacing the current entry, or adding
+    // a new one to the browser history.
+    _updateHash: function(location, fragment, replace) {
+      if (replace) {
+        var s = location.toString().replace(/(javascript:|#).*$/, '');
+        location.replace(s + '#' + fragment);
+      } else {
+        location.hash = fragment;
+      }
+    }
+  });
+}(this));
+
+/*global _: false*/
+(function(root) {
+  root.Parse = root.Parse || {};
+  var Parse = root.Parse;
+  var _ = Parse._;
+
+  /**
+   * Routers map faux-URLs to actions, and fire events when routes are
+   * matched. Creating a new one sets its `routes` hash, if not set statically.
+   * @class
+   *
+   * <p>A fork of Backbone.Router, provided for your convenience.
+   * For more information, see the
+   * <a href="http://documentcloud.github.com/backbone/#Router">Backbone
+   * documentation</a>.</p>
+   */
+  Parse.Router = function(options) {
+    options = options || {};
+    if (options.routes) {
+      this.routes = options.routes;
+    }
+    this._bindRoutes();
+    this.initialize.apply(this, arguments);
+  };
+
+  // Cached regular expressions for matching named param parts and splatted
+  // parts of route strings.
+  var namedParam    = /:\w+/g;
+  var splatParam    = /\*\w+/g;
+  var escapeRegExp  = /[\-\[\]{}()+?.,\\\^\$\|#\s]/g;
+
+  // Set up all inheritable **Parse.Router** properties and methods.
+  _.extend(Parse.Router.prototype, Parse.Events,
+           /** @lends Parse.Router.prototype */ {
+
+    /**
+     * Initialize is an empty function by default. Override it with your own
+     * initialization logic.
+     */
+    initialize: function(){},
+
+    /**
+     * Manually bind a single named route to a callback. For example:
+     *
+     * <pre>this.route('search/:query/p:num', 'search', function(query, num) {
+     *       ...
+     *     });</pre>
+     */
+    route: function(route, name, callback) {
+      Parse.history = Parse.history || new Parse.History();
+      if (!_.isRegExp(route)) {
+        route = this._routeToRegExp(route);
+      }
+      if (!callback) {
+        callback = this[name];
+      }
+      Parse.history.route(route, _.bind(function(fragment) {
+        var args = this._extractParameters(route, fragment);
+        if (callback) {
+          callback.apply(this, args);
+        }
+        this.trigger.apply(this, ['route:' + name].concat(args));
+        Parse.history.trigger('route', this, name, args);
+      }, this));
+      return this;
+    },
+
+    /**
+     * Whenever you reach a point in your application that you'd
+     * like to save as a URL, call navigate in order to update the
+     * URL. If you wish to also call the route function, set the
+     * trigger option to true. To update the URL without creating
+     * an entry in the browser's history, set the replace option
+     * to true.
+     */
+    navigate: function(fragment, options) {
+      Parse.history.navigate(fragment, options);
+    },
+
+    // Bind all defined routes to `Parse.history`. We have to reverse the
+    // order of the routes here to support behavior where the most general
+    // routes can be defined at the bottom of the route map.
+    _bindRoutes: function() {
+      if (!this.routes) {
+        return;
+      }
+      var routes = [];
+      for (var route in this.routes) {
+        if (this.routes.hasOwnProperty(route)) {
+          routes.unshift([route, this.routes[route]]);
+        }
+      }
+      for (var i = 0, l = routes.length; i < l; i++) {
+        this.route(routes[i][0], routes[i][1], this[routes[i][1]]);
+      }
+    },
+
+    // Convert a route string into a regular expression, suitable for matching
+    // against the current location hash.
+    _routeToRegExp: function(route) {
+      route = route.replace(escapeRegExp, '\\$&')
+                   .replace(namedParam, '([^\/]+)')
+                   .replace(splatParam, '(.*?)');
+      return new RegExp('^' + route + '$');
+    },
+
+    // Given a route, and a URL fragment that it matches, return the array of
+    // extracted parameters.
+    _extractParameters: function(route, fragment) {
+      return route.exec(fragment).slice(1);
+    }
+  });
+
+  /**
+   * @function
+   * @param {Object} instanceProps Instance properties for the router.
+   * @param {Object} classProps Class properies for the router.
+   * @return {Class} A new subclass of <code>Parse.Router</code>.
+   */
+  Parse.Router.extend = Parse._extend;
 }(this));
