@@ -2,7 +2,7 @@
  * PARSE SAMPLE CODE
  * from: https://parse.com/apps/quickstart?rf=js#js/blank
  */
-var _ = require('lib/underscore');
+//var _ = require('lib/underscore');
 require('lib/ti.parse');
 //Get your  Keys here: https://www.parse.com/apps/quickstart#js/blank
 Parse.initialize("XXXXXX", "XXXXXXXX");
@@ -119,7 +119,7 @@ function init(){
 	
 	
 	
-	win2.add(label2);
+	win2.add(label1);
 	
 	
 	
